@@ -237,7 +237,7 @@ static int echo_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	irq_nr = pci_irq_vector(pdev, 0);
 	printk("echodev-drv - IRQ Number: %d\n", irq_nr);
 
-	status = devm_request_irq(&pdev->dev, irq_nr, echo_irq_handler, 0,
+	status = devm_request_irq(&pdev->dev, irq_nr, echo_irq_handler, IRQF_SHARED,
 	"echodev-irq", echo);
 	if(status != 0) {
 		printk("echodev-drv - Error requesting interrupt\n");
