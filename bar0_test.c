@@ -17,7 +17,7 @@ int main(int argc, char **argv)
 		printf("Usage: %s <devfile> <cmd> [<arg>]\n", argv[0]);
 		return 0;
 	}
-
+	printf("%s: start to open device %s\n", argv[0], argv[1]);
 	fd = open(argv[1], O_RDWR);
 	if(fd < 0) {
 		perror("open");

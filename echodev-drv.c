@@ -31,6 +31,10 @@ struct echodev {
 	dev_t dev_nr;
 };
 
+
+static struct class *dev_class;
+static struct cdev my_cdev;
+
 /* Global Variables */
 LIST_HEAD(card_list);
 static struct mutex lock;
@@ -127,6 +131,13 @@ static ssize_t echo_read(struct file *file, char __user *user_buffer, size_t cou
         return to_copy - not_copied;
 }
 
+
+// MMIO 如果要映射到用户态，那么就要以 VMA 的形式，
+// 占据 process 的一部分地址空间（映射后可通过 "/proc/<pid>/maps" 看到）。
+// 对此的封装函数是 io_remap_pfn_range 或者 remap_pfn_range（两者在 x86 和 ARM 上都是等效的）
+// ，具体的实现同 ioremap 类似，也是建立各级页表。
+
+
 static int echo_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	int status;
@@ -185,11 +196,15 @@ static struct pci_device_id echo_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, echo_ids);
 
+
+#define IRQF_SHARED		0x00000080
+
 static int echo_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	dump_stack();
 	int status, irq_nr;
 	struct echodev *echo;
-
+	// 分配的内存可以跟设备进行绑定，当设备跟驱动分离时，跟设备绑定的内存会被自动释放
 	echo = devm_kzalloc(&pdev->dev, sizeof(struct echodev), GFP_KERNEL);
 	if(!echo)
 		return -ENOMEM;
@@ -198,6 +213,8 @@ static int echo_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	cdev_init(&echo->cdev, &fops);
 	echo->cdev.owner = THIS_MODULE;
 
+	my_cdev = echo->cdev;
+
 	echo->dev_nr = MKDEV(DEVNR, card_count++);
 	status = cdev_add(&echo->cdev, echo->dev_nr, 1);
 	if(status < 0) {
@@ -205,10 +222,25 @@ static int echo_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return status;
 	}
 
+	if (IS_ERR(dev_class = class_create(THIS_MODULE, "my_class")))
+        return -1;
+
+    if (IS_ERR(device_create(dev_class, NULL, echo->dev_nr, NULL, "echodevtest")))
+        return -1;
+
 	list_add_tail(&echo->list, &card_list);
 	mutex_unlock(&lock);
 
 	echo->pdev = pdev;
+
+	//驱动加载前都要enable下设备
+	// * pci_enable_device - Initialize device before it's used by a driver.
+	// * Initialize device before it's used by a driver. Ask low-level code
+	// * to enable I/O and memory. Wake up the device if it was suspended.
+	// * Beware, this function can fail.
+	// *
+	// * Note we don't actually enable the device many times if we call
+	// * this function repeatedly (we just increment the count).
 
 	status = pcim_enable_device(pdev);
 	if(status != 0) {
@@ -216,15 +248,42 @@ static int echo_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto fdev;
 	}
 
-	pci_set_master(pdev);
+	// 读取配置空间
+	u16 vendorid;
+	u16 deviceid;
+	pci_read_config_word(pdev, PCI_VENDOR_ID, &vendorid);
+	pci_read_config_word(pdev, PCI_DEVICE_ID, &deviceid);
+	pr_info("config vendorid %x\n", vendorid);
+	pr_info("config deviceid %x\n", deviceid);
 
+	// 获取设备的flags
+	if ((pci_resource_flags(pdev, 0) & IORESOURCE_MEM)) {
+		dev_info(&(pdev->dev), "bar 0 pci_resource_flags mem\n");
+	} else {
+		dev_info(&(pdev->dev), "bar 0 pci_resource_flags io\n");
+	}
+
+	if ((pci_resource_flags(pdev, 1) & IORESOURCE_MEM)) {
+		dev_info(&(pdev->dev), "bar 1 pci_resource_flags mem\n");
+	} else {
+		dev_info(&(pdev->dev), "bar 1 pci_resource_flags io\n");
+
+	}
+	// pci_set_master()将通过设置PCI_COMMAND寄存器中的总线主控位来启用DMA。
+	// pci_clear_master() 将通过清除总线主控位来禁用DMA
+	pci_set_master(pdev);
+	// 类似pci_iomap,设备被移除的时候会自动做unmap
 	echo->ptr_bar0 = pcim_iomap(pdev, 0, pci_resource_len(pdev, 0));
 	if(!echo->ptr_bar0) {
 		printk("echodev-drv - Error mapping BAR0\n");
 		status = -ENODEV;
 		goto fdev;
 	}
-
+	//设置pdev的私有数据
+	//static inline void dev_set_drvdata(struct device *dev, void *data)
+	// {
+	// 	dev->driver_data = data;
+	// }
 	pci_set_drvdata(pdev, echo);
 
 	status = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
@@ -237,7 +296,7 @@ static int echo_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	irq_nr = pci_irq_vector(pdev, 0);
 	printk("echodev-drv - IRQ Number: %d\n", irq_nr);
 
-	status = devm_request_irq(&pdev->dev, irq_nr, echo_irq_handler, 0,
+	status = devm_request_irq(&pdev->dev, irq_nr, echo_irq_handler, IRQF_SHARED,
 	"echodev-irq", echo);
 	if(status != 0) {
 		printk("echodev-drv - Error requesting interrupt\n");
@@ -299,6 +358,10 @@ static int __init echo_init(void)
 static void __exit echo_exit(void)
 {
 	dev_t dev_nr = MKDEV(DEVNR, 0);
+
+	device_destroy(dev_class, dev_nr);
+    class_destroy(dev_class);
+    cdev_del(&my_cdev);
 	unregister_chrdev_region(dev_nr, MINORMASK + 1);
 	pci_unregister_driver(&echo_driver);
 }

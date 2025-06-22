@@ -251,6 +251,7 @@ static void pciechodev_class_init(ObjectClass *class, void *data)
 	k->realize = pci_pciechodev_realize;
 	//definition of uninit func().
 	k->exit = pci_pciechodev_uninit;
+	//include/hw/pci/pci.h:56:#define PCI_VENDOR_ID_QEMU   0x1234
 	k->vendor_id = PCI_VENDOR_ID_QEMU;
 	k->device_id = 0xbeef; //our device id, 'beef' hexadecimal
 	k->revision = 0x10;
